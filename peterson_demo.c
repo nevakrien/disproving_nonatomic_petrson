@@ -31,6 +31,12 @@
 
 
 /*────────────────  Critical‑section helpers (x86‑64 only) ───────────────*/
+
+/**
+ * this is inline assembly so we are 100% sure there are no compiler shananigans
+ * the compiler can easily optimize away the memory read/write since a race condition is UB
+ */
+
 /* Thread‑A: atomically write 0 */
 static inline void critical_secssion_a(int *addr)
 {
@@ -99,6 +105,14 @@ typedef struct {
 static shared_pair_t *pairs;
 static int n_pairs, n_cpus;
 
+/**pining to a core seemed like a good idea initiall
+ * however its hard to make it work cross platform.
+ * 
+ * in practice its tricky to get a scheme that makes sure we pin to a legal core number
+ * while making sure the 2 cores dont share L1 cache.
+ * the computer I was testing this on has hyperthreading so that is likely why this code breaks there
+ * 
+ */
 // /* Pin caller to a given logical CPU to maximise inter‑core traffic */
 // static void pin_to_core(int core)
 // {

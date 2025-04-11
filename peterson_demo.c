@@ -37,10 +37,11 @@
  * the compiler can easily optimize away the memory read/write since a race condition is UB
  */
 
-/* Thread‑A: atomically write 0 */
-static inline void critical_secssion_a(int *addr)
-{
 #if defined(__x86_64__)
+
+
+/* Thread‑A: atomically write 0 */
+static inline void critical_section_a(int *addr){
     int zero = 0;
     /* xchg reg, [mem]  ─ full‑barrier atomic store of 0 */
     __asm__ __volatile__("xchg %0, %1"
@@ -48,49 +49,36 @@ static inline void critical_secssion_a(int *addr)
                            "+m"(*addr)          /* %1: memory operand is read‑write          */
                          :
                          : "memory");
-#else
-#   error "x86‑64 only"
-#endif
+
 }
 
-/* Thread‑B: write 1, yield, then divide 1 by the *current* value */
-static inline void critical_secssion_b(int *addr)
-{
-#if defined(__x86_64__)
-    /* 1. atomically store 1 */
+/* Thread‑B: store 1, yield, divide 1 by the *current* value in *addr. */
+static inline void critical_section_b(int *addr){
+    /* 1.  Atomic seq‑cst store of 1 (unchanged). */
     int one = 1;
-    __asm__ __volatile__("xchg %0, %1"
-                         : "+r"(one), "+m"(*addr)
-                         :
-                         : "memory");
+    __asm__ __volatile__("xchg %0, %1" : "+r"(one), "+m"(*addr) :: "memory");
 
-    /* 2. widen the race window so thread‑A can overwrite the value */
+    /* 2.  Give the other thread a chance to stomp the value. */
     sched_yield();
 
-    /* 3. atomically LOAD the present value without changing memory */
-    int val;
+    /* 3 + 4.  Atomic load + divide in one asm block.                     *
+     *        After `lock xaddl`,  %reg == old *addr, memory unchanged.   *
+     *        `idivl %reg` raises #DE if that value is zero.              */
+    int divisor = 0;                    /* xadd’s “addend” — must start at 0 */
     __asm__ __volatile__(
-        "xor    %%eax, %%eax\n\t"        /* EAX = 0                        */
-        "lock   xaddl %%eax, %2\n\t"     /* EAX ← *addr, *addr unchanged   */
-        "movl   %%eax, %0"               /* val  = old *addr               */
-        : "=&r"(val), "+m"(*addr)
-        : "m"(*addr)
-        : "eax", "cc", "memory");
-
-    /* 4. 1 / val   →  #DE (SIGFPE) if val == 0 */
-    __asm__ __volatile__(
-        "movl   $1,  %%eax\n\t"          /* dividend low  = 1 */
-        "xorl   %%edx, %%edx\n\t"        /* dividend high = 0 */
-        "idivl  %0"                      /* divide EDX:EAX by val */
-        :
-        : "r"(val)
-        : "eax", "edx", "cc", "memory");
-#else
-#   error "x86‑64 only"
-#endif
+        "lock   xaddl  %0, %1\n\t"      /* %0 ← *addr (atomic read)         */
+        "movl   $1,    %%eax\n\t"       /* dividend low  = 1                */
+        "xorl   %%edx, %%edx\n\t"       /* dividend high = 0                */
+        "idivl  %0"                     /* 1 ÷ (%0)  →  #DE if (%0)==0      */
+        : "+r"(divisor), "+m"(*addr)
+        :                                /* no further inputs               */
+        : "eax", "edx", "cc", "memory"); /* clobbers: regs, flags, memory   */
 }
 
 
+#else
+#   error "x86‑64 only"
+#endif
 
 
 /* ──────────────────────────────────────────────────────────────── */
@@ -123,8 +111,7 @@ static int n_pairs, n_cpus;
 // }
 
 /* Thread A: writes 0 inside the CS */
-static void *thread_A(void *arg)
-{
+static void *thread_A(void *arg){
     intptr_t id = (intptr_t)arg;
     shared_pair_t *p = &pairs[id];
     // pin_to_core(id * 2);
@@ -136,7 +123,7 @@ static void *thread_A(void *arg)
             ;
 
         /* ---- critical section ---- */
-        critical_secssion_a(&p->value);
+        critical_section_a(&p->value);
         /* -------------------------- */
 
         STORE_FLAG(p->interested0, 0);
@@ -145,8 +132,7 @@ static void *thread_A(void *arg)
 }
 
 /* Thread B: writes 1, yields, then re‑reads and divides */
-static void *thread_B(void *arg)
-{
+static void *thread_B(void *arg){
     intptr_t id = (intptr_t)arg;
     shared_pair_t *p = &pairs[id];
     // pin_to_core(id * 2 + 1);
@@ -158,7 +144,7 @@ static void *thread_B(void *arg)
             ;
 
         /* ---- critical section ---- */
-        critical_secssion_b(&p->value);
+        critical_section_b(&p->value);
         /* -------------------------- */
 
         STORE_FLAG(p->interested1, 0);
@@ -166,9 +152,37 @@ static void *thread_B(void *arg)
     return NULL;
 }
 
+static void sigfpe_handler(int signum, siginfo_t *info, void *ucontext){
+    (void)ucontext; // unused
+
+    if (signum == SIGFPE && info && info->si_code == FPE_INTDIV) {
+        fprintf(stderr, "ERROR: Division by zero detected.\nThe current algorithem is wrong...\n");
+    } else {
+        fprintf(stderr, "ERROR: Received unexpected signal %d.\n", signum);
+    }
+
+    exit(1);
+}
+
+static int sig_handler_install(void){
+    struct sigaction sa = {0};
+
+        sa.sa_sigaction = sigfpe_handler;
+        sa.sa_flags = SA_SIGINFO;
+    
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGFPE, &sa, NULL) != 0) {
+        perror("sigaction");
+        return 1;
+    }
+
+    return 0;
+}
+
+
 /* ──────────────────────────────────────────────────────────────── */
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv){
+    //setup the enviorment we work on
     n_pairs = (argc > 1) ? atoi(argv[1]) : 32;
     if (n_pairs <= 0) {
         fputs("need >0 pairs\n", stderr);
@@ -184,11 +198,15 @@ int main(int argc, char **argv)
     }
     memset(pairs, 0, bytes);
 
-    pthread_t *th = malloc(sizeof(pthread_t) * (size_t)n_pairs * 2);
+    pthread_t *th = (pthread_t *)malloc(sizeof(pthread_t) * (size_t)n_pairs * 2);
     if (!th) {
         perror("malloc");
         return 1;
     }
+
+    //if an error happens its division by 0 so lets catch those
+    if(sig_handler_install())
+        return 1;
 
     fprintf(stderr,
             "Launching %d pairs (%d threads) on %d CPUs %s\n",
